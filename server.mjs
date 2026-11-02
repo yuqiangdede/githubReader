@@ -55,7 +55,8 @@ export const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/api/github') {
       const path = url.searchParams.get('path') || '';
-      if (!/^\/repos\/[\w.-]+\/[\w.-]+(?:\/contents(?:\/[^?]*)?|\/branches)?(?:\?[^#]*)?$/.test(path) && path !== '/user/repos?per_page=100&sort=updated') return json(res, 400, { message: '无效的仓库请求' });
+      const allowed = /^\/repos\/[\w.-]+\/[\w.-]+(?:\/contents(?:\/[^?]*)?|\/branches)?(?:\?[^#]*)?$/.test(path) || path === '/user/repos?per_page=100&sort=updated' || /^\/users\/[\w.-]+\/repos(?:\?[^#]*)?$/.test(path);
+      if (!allowed) return json(res, 400, { message: '无效的仓库请求' });
       return json(res, 200, await github(path, token));
     }
     if (req.method !== 'GET' && req.method !== 'HEAD') return json(res, 405, { message: 'Method not allowed' });

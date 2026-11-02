@@ -8,7 +8,7 @@ final class GitHubPaths {
             URI uri = new URI(value);
             if (uri.isAbsolute() || uri.getRawAuthority() != null || uri.getFragment() != null) return false;
             for (String segment : uri.getPath().split("/")) if (segment.equals(".") || segment.equals("..")) return false;
-            return value.matches("/repos/[\\w.-]+/[\\w.-]+(?:/contents(?:/[^?#]*)?|/branches)?(?:\\?[^#]*)?") || value.equals("/user") || value.equals("/user/repos?per_page=100&sort=updated");
+            return value.matches("/repos/[\\w.-]+/[\\w.-]+(?:/contents(?:/[^?#]*)?|/branches)?(?:\\?[^#]*)?") || value.equals("/user") || value.equals("/user/repos?per_page=100&sort=updated") || value.matches("/users/[\\w.-]+/repos(?:\\?[^#]*)?");
         } catch (Exception e) { return false; }
     }
 }

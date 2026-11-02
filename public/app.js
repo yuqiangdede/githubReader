@@ -1,11 +1,59 @@
 import { parseRepo, plainText, splitText } from './reader.js';
 import { isAndroid, github, tts, defaultClientId } from './native.js';
 const $ = id => document.getElementById(id);
+const defaultOwner = 'yuqiangdede';
 let repo = '', branch = '', directory = '', current = null, chunks = [], index = 0, playing = false, generation = 0, sourceMode = false, deferredInstall;
 const synth = window.speechSynthesis;
 let nativeState = null, notificationAsked = false, authGeneration = 0, authTimer, lastNativeError = '';
 let db;
-let selectedFiles = [], playlist = [], playlistIndex = -1, attachingDocument = false;
+let selectedFiles = [], playlist = [], playlistIndex = -1, attachingDocument = false, fullscreenReading = false;
+const chapterDirectories = new Map();
+const readableFile = f => f.type === 'file' && (/\.(md|markdown|txt|text|rst|csv|json|ya?ml|js|ts|tsx|jsx|py|html|css|java|kt|xml|log|sh)$/i.test(f.name) || !f.name.includes('.'));
+const chapterKey = (repo, branch, path) => JSON.stringify([repo, branch, path]);
+const parentPath = path => path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
+function rememberChapters(list, targetRepo, targetBranch, path) {
+  const files = list.filter(readableFile).sort((a, b) => a.name.localeCompare(b.name, 'zh-CN', { numeric: true })).map(item => ({ ...item, repo: targetRepo, branch: targetBranch }));
+  chapterDirectories.set(chapterKey(targetRepo, targetBranch, path), files);
+  return files;
+}
+function updateChapterButtons(files = []) {
+  const position = current ? files.findIndex(file => file.path === current.path) : -1;
+  $('chapter-previous').disabled = position <= 0;
+  $('chapter-next').disabled = position < 0 || position >= files.length - 1;
+}
+async function loadChapterDirectory(row) {
+  if (row.local) return;
+  const path = parentPath(row.path), key = chapterKey(row.repo, row.branch, path);
+  let files = chapterDirectories.get(key);
+  if (!files) {
+    try {
+      const list = await api(contentPath(path, row.repo, row.branch));
+      if (Array.isArray(list)) files = rememberChapters(list, row.repo, row.branch, path);
+    } catch { /* Reading cached files remains available offline. */ }
+  }
+  if (current === row) updateChapterButtons(files);
+}
+async function navigateChapter(direction) {
+  const row = current;
+  const files = chapterDirectories.get(chapterKey(row.repo, row.branch, parentPath(row.path))) || [];
+  const position = files.findIndex(file => file.path === row.path), target = files[position + direction];
+  if (position < 0 || !target) return;
+  $('chapter-previous').disabled = $('chapter-next').disabled = true;
+  try {
+    let next;
+    try { next = await fetchFile(target); }
+    catch (error) {
+      next = await transaction('readonly', store => store.get(`${target.repo}@${target.branch}:${target.path}`));
+      if (!next) throw error;
+    }
+    playlist = []; playlistIndex = -1;
+    await openDocument(next);
+  } finally {
+    if (current === row) updateChapterButtons(files);
+  }
+}
+$('chapter-previous').onclick = () => run(() => navigateChapter(-1));
+$('chapter-next').onclick = () => run(() => navigateChapter(1));
 const dbReady = new Promise(resolve => {
   const request = indexedDB.open('github-listen', 1);
   request.onupgradeneeded = () => request.result.createObjectStore('files', { keyPath: 'id' });
@@ -31,16 +79,54 @@ async function api(path) {
 }
 function contentPath(path, targetRepo = repo, targetBranch = branch) { return `/repos/${targetRepo}/contents${path ? '/' + path.split('/').map(encodeURIComponent).join('/') : ''}?ref=${encodeURIComponent(targetBranch)}`; }
 async function connect() {
-  const candidate = parseRepo($('repo').value); $('files').textContent = '正在连接仓库…';
-  const info = await api(`/repos/${candidate}`); repo = candidate; branch = info.default_branch; directory = '';
+  const candidate = parseRepo($('repo').value);
+  $('enter-files').disabled = true; $('branch').disabled = true;
+  const info = await api(`/repos/${candidate}`);
+  repo = candidate; branch = info.default_branch; directory = '';
   $('branch').replaceChildren(new Option(branch, branch));
-  await browse('');
-  try { const branches = await api(`/repos/${repo}/branches`); $('branch').replaceChildren(...branches.map(b => new Option(b.name, b.name, false, b.name === branch))); } catch { /* default branch remains usable */ }
+  try { const branches = await api(`/repos/${repo}/branches`); if (branches.length) $('branch').replaceChildren(...branches.map(b => new Option(b.name, b.name, false, b.name === branch))); } catch { /* default branch remains usable */ }
+  $('branch').disabled = false; $('enter-files').disabled = false; updateRepositorySummary();
 }
+let ownerReposLoading = false, ownerReposLoaded = false;
+async function loadOwnerRepos(refresh = false) {
+  if (ownerReposLoading || ownerReposLoaded && !refresh) return;
+  ownerReposLoading = true;
+  const select = $('owner-repos');
+  select.replaceChildren(new Option(`正在读取 ${defaultOwner} 的仓库…`, ''));
+  try {
+    const list = await api(`/users/${defaultOwner}/repos?per_page=100&sort=updated`);
+    const repos = (Array.isArray(list) ? list : []).filter(item => item && typeof item.full_name === 'string')
+      .sort((a, b) => a.name.localeCompare(b.name, 'zh-CN', { numeric: true }));
+    select.replaceChildren(
+      new Option(repos.length ? `选择 ${defaultOwner} 的仓库（${repos.length} 个）` : `${defaultOwner} 暂无公开仓库`, ''),
+      ...repos.map(item => new Option(`${item.name || item.full_name}${item.private ? '（私有）' : ''}${item.archived ? '（已归档）' : ''}`, item.full_name))
+    );
+    ownerReposLoaded = true;
+  } catch {
+    ownerReposLoaded = false;
+    select.replaceChildren(new Option('无法读取仓库列表，可手动输入地址', ''));
+  } finally { ownerReposLoading = false; }
+}
+$('owner-repos').onchange = () => {
+  const value = $('owner-repos').value;
+  if (!value) return;
+  $('repo').value = value;
+  run(connect);
+};
+$('owner-repos').addEventListener('focus', () => { if (!ownerReposLoaded) loadOwnerRepos(); });
+function updateRepositorySummary() { $('repository-summary').textContent = repo ? `${repo} · ${branch}` : ''; }
+function showLibraryStep(step) {
+  const files = step === 'files';
+  $('repository-step').hidden = files; $('file-step').hidden = !files;
+  $('library').classList.toggle('file-page', files);
+}
+$('back-to-repository').onclick = () => showLibraryStep('repository');
+$('enter-files').onclick = () => run(async () => { await browse(''); showLibraryStep('files'); });
 async function browse(path) {
   directory = path; $('files').textContent = '正在读取目录…';
   const list = await api(contentPath(path));
   if (!Array.isArray(list)) throw new Error('该路径不是目录');
+  rememberChapters(list, repo, branch, path);
   $('breadcrumbs').replaceChildren();
   const crumbs = [['仓库', '']]; let accumulated = '';
   for (const part of path.split('/').filter(Boolean)) { accumulated += (accumulated ? '/' : '') + part; crumbs.push([part, accumulated]); }
@@ -76,6 +162,25 @@ async function fetchFile(item) {
   return { id, repo: targetRepo, branch: targetBranch, path: item.path, raw, position: old?.raw === raw ? old.position : 0, resetProgress: old?.raw !== raw, updated: Date.now() };
 }
 async function loadFile(item) { await openDocument(await fetchFile(item)); }
+$('open-local').onclick = () => $('local-file').click();
+$('local-file').onchange = () => {
+  const file = $('local-file').files[0];
+  $('local-file').value = '';
+  if (!file) return;
+  run(async () => {
+    if (file.size > 10 * 1024 * 1024) throw new Error('请选择不超过 10 MB 的文本文件');
+    let raw;
+    try { raw = new TextDecoder('utf-8', { fatal: true }).decode(await file.arrayBuffer()); }
+    catch { throw new Error('无法读取文件，请选择 UTF-8 编码的文本文件'); }
+    if (raw.includes('\0')) throw new Error('此文件包含二进制内容，无法朗读');
+    await dbReady;
+    const id = 'local:' + JSON.stringify([file.name, file.size, file.lastModified]);
+    const old = await transaction('readonly', store => store.get(id));
+    const row = { id, local: true, repo: '本地文件', branch: '', path: file.name, raw, position: old?.raw === raw ? old.position : 0, resetProgress: old?.raw !== raw, updated: Date.now() };
+    playlist = []; playlistIndex = -1;
+    await openDocument(row);
+  });
+};
 function renderQueue() {
   $('queue-count').textContent = `${selectedFiles.length} 个文件`;
   $('queue-play').disabled = $('queue-clear').disabled = !selectedFiles.length;
@@ -117,12 +222,14 @@ async function openDocument(row, attach = false) {
   }
   $('file-title').textContent = row.path.split('/').pop(); $('track-name').textContent = $('file-title').textContent;
   $('file-meta').textContent = `${row.raw.length.toLocaleString()} 字符`;
-  $('track-detail').textContent = row.repo; $('reading-status').textContent = `${row.branch} · 点击句子，从这里播放`;
-  $('mode').disabled = false; $('mode').textContent = '查看原文';
+  $('track-detail').textContent = row.repo;
+  $('mode').disabled = false; setModeButton();
+  for (const id of ['fullscreen', 'scroll-top', 'scroll-bottom']) $(id).disabled = false;
   for (const id of ['play','previous','next','progress']) $(id).disabled = !chunks.length || (!isAndroid && !synth);
   $('progress').max = Math.max(0, chunks.length-1); $('total').textContent = `${chunks.length} 段`;
   document.body.classList.add('reading-mode'); setLibraryOpen(false);
-  render(); update(); await saveCurrent(); await recent();
+  updateChapterButtons(); loadChapterDirectory(row);
+  render(true); update(false); await saveCurrent(); await recent();
   if (!chunks.length) notice('文件没有可朗读的正文');
 }
 function setLibraryOpen(open) {
@@ -133,19 +240,85 @@ function setLibraryOpen(open) {
 }
 $('library-toggle').onclick = () => setLibraryOpen($('library').hidden);
 $('library-close').onclick = () => setLibraryOpen(false);
-function render() {
-  $('document').replaceChildren();
-  if (sourceMode) { const pre = document.createElement('pre'); pre.className = 'source'; pre.textContent = current.raw; $('document').append(pre); return; }
-  const fragment = document.createDocumentFragment();
-  chunks.forEach((text,i) => { const p = document.createElement('p'); p.className = 'segment'; p.textContent = text; p.dataset.index = i; p.tabIndex = 0; p.setAttribute('role', 'button'); p.setAttribute('aria-label', `从此句开始播放：${text}`); p.onclick = () => { if (!window.getSelection()?.toString()) playFrom(i); }; p.onkeydown = event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); playFrom(i); } }; fragment.append(p); });
-  $('document').append(fragment);
+function setFullscreenReading(enabled) {
+  fullscreenReading = enabled;
+  if (enabled) stop();
+  document.body.classList.toggle('fullscreen-reading', enabled);
+  $('fullscreen').textContent = enabled ? '退出全屏' : '全屏阅读';
+  $('fullscreen').setAttribute('aria-pressed', String(enabled));
+  render(); update();
 }
-function update() {
+$('fullscreen').onclick = () => setFullscreenReading(!fullscreenReading);
+$('scroll-top').onclick = () => $('document').scrollTo({ top: 0, behavior: 'smooth' });
+$('scroll-bottom').onclick = () => $('document').scrollTo({ top: $('document').scrollHeight, behavior: 'smooth' });
+function turnPage(direction) {
+  const article = $('document');
+  article.scrollBy({ top: direction * Math.max(1, article.clientHeight - 40), behavior: 'smooth' });
+}
+$('page-previous').onclick = () => turnPage(-1);
+$('page-next').onclick = () => turnPage(1);
+document.addEventListener('keydown', event => {
+  if (!fullscreenReading) return;
+  if (event.key === 'Escape') setFullscreenReading(false);
+  else if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+    event.preventDefault(); turnPage(event.key === 'ArrowLeft' ? -1 : 1);
+  }
+});
+let touchStart = null;
+$('document').addEventListener('touchstart', event => {
+  touchStart = fullscreenReading && event.touches.length === 1 ? { x: event.touches[0].clientX, y: event.touches[0].clientY } : null;
+}, { passive: true });
+$('document').addEventListener('touchend', event => {
+  if (!touchStart || !fullscreenReading || event.changedTouches.length !== 1 || window.getSelection()?.toString()) { touchStart = null; return; }
+  const dx = event.changedTouches[0].clientX - touchStart.x, dy = event.changedTouches[0].clientY - touchStart.y;
+  touchStart = null;
+  if (Math.abs(dx) >= 60 && Math.abs(dx) > Math.abs(dy) * 1.5) turnPage(dx > 0 ? -1 : 1);
+}, { passive: true });
+$('document').addEventListener('touchcancel', () => { touchStart = null; });
+function render(resetScroll = false) {
+  const scrollTop = resetScroll ? 0 : $('document').scrollTop;
+  $('document').replaceChildren();
+  if (sourceMode) { const pre = document.createElement('pre'); pre.className = 'source'; pre.textContent = current.raw; $('document').append(pre); $('document').scrollTo({ top: scrollTop, behavior: 'instant' }); return; }
+  const fragment = document.createDocumentFragment();
+  chunks.forEach((text,i) => { const p = document.createElement('p'); p.className = 'segment'; p.textContent = text; p.dataset.index = i; if (!fullscreenReading) { p.tabIndex = 0; p.setAttribute('role', 'button'); p.setAttribute('aria-label', `从此句开始播放：${text}`); p.onclick = () => { if (!window.getSelection()?.toString()) playFrom(i); }; p.onkeydown = event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); playFrom(i); } }; } fragment.append(p); });
+  $('document').append(fragment); $('document').scrollTo({ top: scrollTop, behavior: 'instant' });
+}
+function renderPlaybackList() {
+  $('show-playlist').disabled = !playlist.length;
+  $('show-playlist').textContent = playlist.length ? `列表 ${playlistIndex + 1}/${playlist.length}` : '列表';
+  $('show-playlist').setAttribute('aria-label', playlist.length ? `播放列表 ${playlistIndex + 1}/${playlist.length}` : '播放列表');
+  $('playback-list').replaceChildren(...playlist.map((entry, i) => {
+    const li = document.createElement('li');
+    const button = document.createElement('button'); button.className = 'playback-file';
+    if (i === playlistIndex) { button.classList.add('active'); button.setAttribute('aria-current', 'true'); }
+    const name = document.createElement('span'); name.textContent = entry.row.path.split('/').pop();
+    const status = document.createElement('small'); status.textContent = i === playlistIndex ? '当前' : i > playlistIndex ? '待播放' : '已播放';
+    button.title = `${entry.row.repo} / ${entry.row.path}`; button.append(name, status);
+    button.onclick = () => run(() => selectPlaylistFile(i)); li.append(button); return li;
+  }));
+}
+$('show-playlist').onclick = () => { renderPlaybackList(); $('playlist-dialog').showModal(); };
+$('close-playlist').onclick = () => $('playlist-dialog').close();
+async function selectPlaylistFile(target) {
+  if (!playlist[target]) return;
+  if (isAndroid) {
+    const resume = playing; attachingDocument = true;
+    try {
+      const state = await tts.selectPlaylistFile({ index: target });
+      nativeState = state; playlistIndex = target;
+      await openDocument(playlist[target].row, true);
+      if (!resume) speak();
+    } finally { attachingDocument = false; }
+  } else { playlistIndex = target; playlist[target].row.position = 0; await openDocument(playlist[target].row); speak(); }
+  $('playlist-dialog').close();
+}
+function update(followPlayback = true) {
+  renderPlaybackList();
   $('progress').value = index; $('position').textContent = chunks.length ? index + 1 : 0;
   $('play').textContent = playing ? 'Ⅱ' : '▶'; $('play').setAttribute('aria-label', playing ? '暂停' : '播放');
   $('document').querySelector('.current')?.classList.remove('current');
   const el = $('document').querySelector(`[data-index="${index}"]`); if (playing) el?.classList.add('current');
-  if (playing && el) $('document').scrollTo({ top: el.offsetTop - 40, behavior: 'smooth' });
+  if (followPlayback && playing && el) $('document').scrollTo({ top: el.offsetTop - 40, behavior: 'smooth' });
 }
 function stop() { generation++; playing = false; if (isAndroid) run(() => tts.pause()); else synth?.cancel(); update(); }
 function speak() {
@@ -155,10 +328,9 @@ function speak() {
   function next() {
     if (version !== generation || !playing) return;
     const utterance = new SpeechSynthesisUtterance(chunks[index]);
-    utterance.rate = Number($('rate').value); utterance.lang = 'zh-CN';
-    const voice = synth.getVoices().find(v => v.voiceURI === $('voice').value); if (voice) { utterance.voice = voice; utterance.lang = voice.lang; }
+    utterance.lang = 'zh-CN';
     utterance.onend = () => { if (version !== generation) return; if (index < chunks.length-1) { index++; update(); saveCurrent(); next(); } else { playing = false; update(); if (playlistIndex >= 0) run(advancePlaylist); else { saveCurrent(); notice('这份文字已朗读完毕'); } } };
-    utterance.onerror = e => { if (version !== generation) return; playing = false; update(); if (!['canceled','interrupted'].includes(e.error)) notice('设备朗读失败，请检查系统 TTS 或切换声音后重试'); };
+    utterance.onerror = e => { if (version !== generation) return; playing = false; update(); if (!['canceled','interrupted'].includes(e.error)) notice('设备朗读失败，请检查系统语音设置后重试'); };
     synth.speak(utterance);
   }
   next();
@@ -171,21 +343,22 @@ function playFrom(value) {
 function seek(value) { if (isAndroid) { run(() => tts.seek({ index: value })); return; } const resume = playing; stop(); index = Math.max(0,Math.min(chunks.length-1,value)); update(); saveCurrent(); if (resume) speak(); }
 async function run(action) { try { await action(); } catch (e) { notice(e.message); if ($('files').textContent.includes('正在')) $('files').textContent = e.message; } }
 $('repo-form').onsubmit = e => { e.preventDefault(); run(connect); };
-$('demo').onclick = () => run(connect);
-$('branch').onchange = () => { branch = $('branch').value; run(() => browse('')); };
+$('demo').onclick = () => run(async () => { await connect(); await browse(''); setLibraryOpen(true); showLibraryStep('files'); });
+$('branch').onchange = () => { branch = $('branch').value; updateRepositorySummary(); };
 $('play').onclick = () => playing ? (stop(), saveCurrent()) : speak();
 $('previous').onclick = () => seek(index-1); $('next').onclick = () => seek(index+1);
 $('progress').oninput = () => seek(Number($('progress').value));
-$('rate').value = localStorage.getItem('rate') || '1';
-$('rate').onchange = () => { localStorage.setItem('rate', $('rate').value); if (isAndroid) run(configureNative); else if (playing) speak(); };
-function voices() { const preferred = localStorage.getItem('voice') || ''; $('voice').replaceChildren(new Option('系统默认', '')); for (const v of synth.getVoices().sort((a,b) => Number(b.lang.startsWith('zh'))-Number(a.lang.startsWith('zh')))) $('voice').append(new Option(`${v.name}${v.localService ? ' · 本机' : ' · 网络'}`, v.voiceURI, false, v.voiceURI === preferred)); }
-if (!isAndroid) { if (synth) { voices(); synth.addEventListener('voiceschanged', voices); } else notice('此浏览器不支持 TTS，请使用安卓 Chrome 或 Edge'); }
-$('voice').onchange = () => { localStorage.setItem('voice', $('voice').value); if (isAndroid) run(configureNative); else if (playing) speak(); };
-$('mode').onclick = () => { sourceMode = !sourceMode; $('mode').textContent = sourceMode ? '返回朗读正文' : '查看原文'; render(); update(); };
+if (!isAndroid && !synth) notice('此浏览器不支持 TTS，请使用安卓 Chrome 或 Edge');
+function setModeButton() {
+  const label = sourceMode ? '返回朗读正文' : '查看原文';
+  $('mode').textContent = sourceMode ? '正文' : '原文';
+  $('mode').title = label; $('mode').setAttribute('aria-label', label); $('mode').setAttribute('aria-pressed', String(sourceMode));
+}
+$('mode').onclick = () => { sourceMode = !sourceMode; setModeButton(); render(); update(); };
 $('clear-cache').onclick = () => run(async () => { if (!confirm('清除本设备所有离线文件和已保存进度？')) return; if (current) current.cached = false; await transaction('readwrite', s => s.clear()); if (isAndroid) await tts.clearProgress(); await recent(); notice('已清除离线文件'); });
 $('login').onclick = () => run(async () => {
   if (isAndroid) {
-    if ($('login').dataset.logged === 'true') { await github.logout(); setLogin(false); $('repos').hidden = true; notice('已退出 GitHub；离线文件可在书架中清除'); }
+    if ($('login').dataset.logged === 'true') { await github.logout(); setLogin(false); $('repos').hidden = true; loadOwnerRepos(true); notice('已退出 GitHub；离线文件可在书架中清除'); }
     else { $('auth-dialog').showModal(); $('auth-error').textContent = ''; }
     return;
   }
@@ -198,22 +371,15 @@ $('install').onclick = async () => { await deferredInstall?.prompt(); deferredIn
 window.addEventListener('online', () => $('connection').textContent = '设备朗读'); window.addEventListener('offline', () => { $('connection').textContent = '离线模式'; notice('已离线，可继续打开“最近听过”的文件'); });
 window.addEventListener('pagehide', () => { saveCurrent(); if (!isAndroid) synth?.cancel(); });
 if (!isAndroid && 'serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => notice('离线功能未能启用，请确认使用 HTTPS 或 localhost'));
+loadOwnerRepos();
 await dbReady;
 function setLogin(logged, login) { $('login').dataset.logged = String(logged); $('login').textContent = logged ? `${login} · 退出` : 'GitHub 登录 ↗'; }
-async function configureNative() { await tts.configure({ rate: Number($('rate').value), voice: $('voice').value }); }
-async function nativeVoices() {
-  const data = await tts.voices();
-  $('voice').replaceChildren(new Option('引擎默认声音', ''), ...data.voices.sort((a,b) => Number(b.lang.startsWith('zh'))-Number(a.lang.startsWith('zh'))).map(v => new Option(`${v.name} · ${v.local ? '离线' : '需联网'}`,v.id,false,v.id === nativeState.voice)));
-  $('engine').replaceChildren(new Option('系统默认引擎', ''), ...data.engines.map(e => new Option(e.name,e.id,false,e.id === nativeState.engine)));
-}
 if (isAndroid) {
-  document.body.classList.add('android'); $('connection').textContent = '安卓原生 TTS'; $('native-settings').hidden = false;
+  document.body.classList.add('android'); $('connection').textContent = '安卓原生 TTS'; $('tts-settings').hidden = false;
   $('platform-note').textContent = '手机独立运行 · 原生 TTS · 支持锁屏朗读';
   $('client-id').value = defaultClientId;
   $('tts-settings').onclick = () => run(() => tts.openSettings());
-  $('engine').onchange = () => run(() => tts.engine({ engine: $('engine').value }));
   await tts.addListener('state', state => {
-    const refresh = state.ready && (!nativeState?.ready || nativeState.engine !== state.engine);
     nativeState = state;
     if (current?.id === state.documentId) { index = state.index; playing = state.playing; update(); saveCurrent(); }
     else if (state.playing && state.documentId && !attachingDocument) {
@@ -227,12 +393,13 @@ if (isAndroid) {
       } finally { attachingDocument = false; } });
     }
     if (state.error && state.error !== lastNativeError) notice(state.error); lastNativeError = state.error;
-    if (refresh) run(nativeVoices);
   });
   try {
     nativeState = await tts.initialize();
-    if (nativeState.ready) await nativeVoices();
-    $('rate').value = String(nativeState.rate || 1);
+    if (nativeState.playlist?.length) {
+      const rows = await Promise.all(nativeState.playlist.map(id => transaction('readonly', store => store.get(id))));
+      if (rows.every(Boolean)) { playlist = rows.map(row => ({ row })); playlistIndex = nativeState.playlistIndex; }
+    }
     if (nativeState.documentId) { const row = await transaction('readonly', s => s.get(nativeState.documentId)); if (row) await openDocument(row, true); }
   } catch (e) { notice(e.message); }
   try { const session = await github.session(); setLogin(session.loggedIn, session.login); $('client-id').value = session.clientId || defaultClientId; } catch (e) { notice(e.message); }
@@ -254,7 +421,7 @@ if (isAndroid) {
           const result = await github.pollLogin();
           if (version !== authGeneration) return;
           if (result.pending) authTimer = setTimeout(poll, result.interval * 1000);
-          else { setLogin(true, result.login); $('auth-dialog').close(); notice('GitHub 登录成功，现在可以浏览授权的仓库'); }
+          else { setLogin(true, result.login); $('auth-dialog').close(); loadOwnerRepos(true); notice('GitHub 登录成功，现在可以浏览授权的仓库'); }
         } catch (error) { if (version === authGeneration) { $('auth-error').textContent = error.message; $('start-auth').disabled = false; } }
       };
       authTimer = setTimeout(poll, flow.interval * 1000);

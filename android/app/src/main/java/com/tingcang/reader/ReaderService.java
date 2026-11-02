@@ -37,7 +37,7 @@ public class ReaderService extends Service {
         super.onCreate();
         var saved = getSharedPreferences("playback", MODE_PRIVATE);
         documentId = saved.getString("documentId", ""); index = saved.getInt("index", 0);
-        engine = saved.getString("engine", ""); voice = saved.getString("voice", ""); rate = saved.getFloat("rate", 1);
+        // Use system TTS defaults instead of legacy in-app preferences.
         audio = (AudioManager) getSystemService(AUDIO_SERVICE);
         wake = ((PowerManager) getSystemService(POWER_SERVICE)).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "tingcang:reading");
         if (Build.VERSION.SDK_INT >= 26) ((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).createNotificationChannel(new NotificationChannel(CHANNEL, "文字朗读", NotificationManager.IMPORTANCE_LOW));
@@ -66,7 +66,7 @@ public class ReaderService extends Service {
                 @Override public void onDone(String id) { main.post(() -> { if (!playing || !id.equals(String.valueOf(serial))) return; if (index + 1 < chunks.length()) { index++; speakCurrent(); } else if (playlistIndex >= 0 && playlistIndex + 1 < playlist.length()) { save(); playlistIndex++; selectPlaylistDocument(); speakCurrent(); } else { playing = false; releaseAudio(); save(); emit(); updateMedia(); stopForeground(STOP_FOREGROUND_REMOVE); foreground = false; stopSelf(); } }); }
                 @Override public void onError(String id) { main.post(() -> { if (!id.equals(String.valueOf(serial))) return; error = "朗读失败，请检查语音包或切换声音"; pause(); }); }
             });
-            applyVoice(); emit();
+            emit();
         }), engine.isEmpty() ? null : engine);
     }
     @Override public IBinder onBind(Intent intent) { return binder; }
@@ -81,7 +81,7 @@ public class ReaderService extends Service {
     }
     public void addObserver(Observer observer) { observers.add(observer); }
     public void removeObserver(Observer observer) { observers.remove(observer); }
-    public JSObject state() { return new JSObject().put("ready", ready).put("playing", playing).put("documentId", documentId).put("index", index).put("total", chunks.length()).put("error", error).put("engine", engine).put("voice", voice).put("rate", rate); }
+    public JSObject state() { var ids = new com.getcapacitor.JSArray(); for (int i = 0; i < playlist.length(); i++) ids.put(playlist.optJSONObject(i).optString("documentId")); return new JSObject().put("playlist", ids).put("playlistIndex", playlistIndex).put("ready", ready).put("playing", playing).put("documentId", documentId).put("index", index).put("total", chunks.length()).put("error", error).put("engine", engine).put("voice", voice).put("rate", rate); }
     private void emit() { JSObject state = state(); for (Observer observer : new ArrayList<>(observers)) observer.changed(state); }
     private void save() {
         var editor = getSharedPreferences("playback", MODE_PRIVATE).edit().putString("documentId", documentId).putInt("index", index).putString("engine", engine).putString("voice", voice).putFloat("rate", rate);
@@ -94,6 +94,11 @@ public class ReaderService extends Service {
     }
     public void loadPlaylist(JSONArray documents) {
         pause(); playlist = documents; playlistIndex = 0; selectPlaylistDocument(); error = ""; save(); emit(); updateMedia();
+    }
+    public void selectPlaylistFile(int target) {
+        if (target < 0 || target >= playlist.length()) throw new IllegalArgumentException("文件不在播放队列中");
+        save(); playlistIndex = target; selectPlaylistDocument();
+        if (playing) speakCurrent(); else { save(); emit(); updateMedia(); }
     }
     private void selectPlaylistDocument() {
         var document = playlist.optJSONObject(playlistIndex);

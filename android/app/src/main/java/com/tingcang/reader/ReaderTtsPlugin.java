@@ -41,6 +41,7 @@ public class ReaderTtsPlugin extends Plugin {
         }
         service.loadPlaylist(documents); call.resolve(service.state());
     }); }
+    @PluginMethod public void selectPlaylistFile(PluginCall call) { main(call, () -> { service.selectPlaylistFile(call.getInt("index", -1)); call.resolve(service.state()); }); }
     @PluginMethod public void play(PluginCall call) { main(call, () -> { service.startPlayback(); call.resolve(); }); }
     @PluginMethod public void pause(PluginCall call) { main(call, () -> { service.pause(); call.resolve(service.state()); }); }
     @PluginMethod public void seek(PluginCall call) { main(call, () -> { service.seek(call.getInt("index", 0)); call.resolve(service.state()); }); }
